@@ -60,7 +60,7 @@
 
 1. Создай новый проект в Claude.
 2. Открой файл **[job-search.md,](https://github.com/BermanRoman/prompt-job-search/blob/main/job-search.md)** скопируй его содержимое кнопкой «Copy» и вставь в поле «Инструкции» проекта.
-3. Скачай из этого репозитория файл методички **[methodology.md](https://github.com/BermanRoman/prompt-job-search/blob/main/methodology.md)** и добавь его в проект как документ в пространство файлов.
+3. Скачай из этого репозитория файл методички **[job-search-methodology.md](https://github.com/BermanRoman/prompt-job-search/blob/main/job-search-methodology.md)** и добавь его в проект как документ в пространство файлов.
 4. Напиши в чате проекта сообщение: _«Начинаем работу по трудоустройству, согласно заложенной в тебя инструкции и методички в пространстве файлов»_
 
 Полезно посмотреть на ту же ситуацию со стороны работодателя — как он собирает воронку найма и чем фильтрует отклики. Это разобрано в [конструкторе найма персонала](https://github.com/BermanRoman/promt-hiring-staff).

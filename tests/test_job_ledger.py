@@ -13,6 +13,9 @@ from threading import Barrier
 SPEC = importlib.util.spec_from_file_location('ledger', Path(__file__).parents[1] / 'scripts/job_ledger.py')
 M = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(M)
+TABLE_SPEC = importlib.util.spec_from_file_location('company_table', Path(__file__).parents[1] / 'scripts/company_table.py')
+TABLE = importlib.util.module_from_spec(TABLE_SPEC)
+TABLE_SPEC.loader.exec_module(TABLE)
 
 
 class LedgerTest(unittest.TestCase):
@@ -30,13 +33,23 @@ class LedgerTest(unittest.TestCase):
     def run_cmd(self, command, data=None):
         return self.ledger.run(command, data)
 
-    def vacancy(self, oid='role-1', source='hh', sid='123', content=None):
-        return {'source': source, 'id': sid, 'opportunity_id': oid, 'company_id': 'company-1',
+    def vacancy(self, oid='role-1', source='hh', sid='123', content=None, company_id='company-1'):
+        return {'source': source, 'id': sid, 'opportunity_id': oid, 'company_id': company_id,
                 'identity_evidence': 'Synthetic matching employer requisition REQ-1',
                 'content': content or {'title': 'Example role'}}
 
     def import_one(self, **kwargs):
+        self.install_card(kwargs.get('company_id', 'company-1'))
         return self.run_cmd('import', {'vacancies': [self.vacancy(**kwargs)]})
+
+    def install_card(self, company_id):
+        self.ledger.db.execute(TABLE.SCHEMA)
+        evidence = {'source': 'fixture:verified-synthetic', 'scope': 'synthetic test only',
+                    'checked_at': '2029-12-31T00:00:00Z', 'valid_until': '2030-01-05T00:00:00Z'}
+        synthetic_inn = '99' + str(int(M.hashlib.sha256(company_id.encode()).hexdigest()[:8], 16)).zfill(10)[-8:]
+        body = {'company_id': company_id, 'wave': 1, 'inn': synthetic_inn,
+                'checks': {name: {'status': 'pass', 'evidence': [evidence]} for name in TABLE.screen.CHECKS}}
+        TABLE.import_cards(self.ledger.db, {'companies': [{**body, 'expected_version': None}]}, self.clock)
 
     def policy(self, **updates):
         data = {'id': 'permission-1', 'expires_at': '2030-01-02T00:00:00Z',
@@ -126,16 +139,96 @@ class LedgerTest(unittest.TestCase):
 
     def test_daily_cap_utc_and_not_double_counting(self):
         self.import_one()
-        policy = self.policy(max_daily=1, expires_at='2030-01-04T00:00:00Z')
+        policy = self.policy(max_daily=1, expires_at='2030-01-04T00:00:00Z', company_ids=['company-1', 'company-2'])
         first = self.reserve(policy=policy)
         self.run_cmd('outcome', {**first_without_status(first), 'status': 'sent', 'receipt': 'synthetic receipt'})
-        self.import_one(oid='role-2', sid='2')
+        self.import_one(oid='role-2', sid='2', company_id='company-2')
         prepared = self.reviewed('role-2')
         with self.assertRaises(ValueError):
             self.reserve('role-2', policy, prepared)
         self.clock += timedelta(days=1)
         self.reserve('role-2', policy, prepared)
         self.assertEqual(self.ledger.db.execute('SELECT count(*) FROM attempts').fetchone()[0], 2)
+
+    def test_company_dedup_across_waves_channels_and_changed_text(self):
+        self.import_one()
+        first = self.reserve()
+        self.run_cmd('outcome', {**first_without_status(first), 'status': 'sent', 'receipt': 'HH receipt'})
+        self.import_one(oid='unsolicited', source='company_proposal', sid='company-1:proposal',
+                        content={'kind': 'company_proposal', 'need': 'hypothesis, not vacancy'})
+        self.artifact.write_text('A different letter to the director')
+        p = self.reviewed('unsolicited', channel='email', recipient='director@example.invalid')
+        with self.assertRaisesRegex(ValueError, 'company already contacted'):
+            self.reserve('unsolicited', prepared=p)
+        self.assertEqual(self.run_cmd('queue')['queue'], [])
+        self.assertEqual(self.run_cmd('status')['opportunities'][1]['state'], 'company_contacted')
+        self.ledger.close()
+        self.ledger = M.Ledger(self.path, now=lambda: self.clock)
+        with self.assertRaisesRegex(ValueError, 'company already contacted'):
+            self.reserve('unsolicited', prepared=p)
+
+    def test_concurrent_different_opportunities_same_company(self):
+        self.import_one()
+        self.import_one(oid='role-2', sid='2', source='ats')
+        policy = self.policy()
+        requests = []
+        for oid in ('role-1', 'role-2'):
+            p = self.reviewed(oid, channel='email', recipient=oid + '@example.invalid')
+            requests.append({'opportunity_id': oid, **policy, 'payload_digest': p['payload_digest']})
+        self.assertEqual(sorted(self.concurrent_reserve(requests)), ['denied', 'reserved'])
+
+    def test_unknown_and_rejected_keep_company_lock(self):
+        self.import_one()
+        first = self.reserve()
+        self.import_one(oid='role-2', sid='2')
+        p = self.reviewed('role-2', channel='email')
+        for state in ('unknown', 'rejected'):
+            self.run_cmd('outcome', {**first_without_status(first), 'status': state,
+                                     'external_evidence': 'synthetic provider evidence'})
+            with self.assertRaisesRegex(ValueError, 'company already contacted'):
+                self.reserve('role-2', prepared=p)
+
+    def test_cc_changes_invalidate_payload_and_card_is_required_for_proposal(self):
+        self.import_one()
+        self.artifact.write_text('{"to":["director@example.invalid"],"cc":[],"body":"proposal"}')
+        p = self.reviewed(channel='email')
+        self.artifact.write_text('{"to":["director@example.invalid"],"cc":["hr@example.invalid"],"body":"proposal"}')
+        with self.assertRaisesRegex(ValueError, 'artifact changed'):
+            self.reserve(prepared=p)
+        self.import_one(oid='proposal', source='company_proposal', sid='proposal')
+        self.ledger.db.execute('DELETE FROM company_cards')
+        p = self.reviewed('proposal', channel='email')
+        with self.assertRaisesRegex(ValueError, 'requires a current company card'):
+            self.reserve('proposal', prepared=p)
+
+    def test_every_source_needs_card_and_no_contact_blocks_future_company_op(self):
+        for source in ('hh', 'ats', 'email'):
+            self.import_one(oid=source, source=source, sid=source)
+            self.ledger.db.execute('DELETE FROM company_cards')
+            p = self.reviewed(source, channel='email')
+            with self.assertRaisesRegex(ValueError, 'requires a current company card'):
+                self.reserve(source, prepared=p)
+        self.install_card('company-1')
+        self.run_cmd('block', {'opportunity_id': 'hh', 'reason': 'no_contact',
+                               'external_evidence': 'company says do not contact'})
+        self.import_one(oid='future', sid='future')
+        with self.assertRaises(ValueError):
+            self.prepare('future', channel='email')
+        self.assertEqual(self.run_cmd('queue')['queue'], [])
+
+    def test_company_card_change_and_expiry_block_reservation(self):
+        self.import_one()
+        p = self.reviewed(channel='email')
+        card = TABLE.get_card(self.ledger.db, 'company-1')
+        body = dict(card['body'], role='changed synthetic role', expected_version=card['version'])
+        TABLE.import_cards(self.ledger.db, {'companies': [body]}, self.clock)
+        with self.assertRaisesRegex(ValueError, 'company card changed'):
+            self.reserve(prepared=p)
+        p = self.reviewed(channel='email')
+        self.clock = datetime(2030, 1, 5, tzinfo=timezone.utc)
+        policy = self.policy(id='late-policy', expires_at='2030-01-10T00:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'company checks'):
+            self.reserve(prepared=p, policy=policy)
 
     def test_crash_pending_unknown_and_receipt(self):
         self.import_one()

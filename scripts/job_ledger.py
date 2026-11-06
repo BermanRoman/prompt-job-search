@@ -6,6 +6,7 @@ Keep the database and inputs private and outside the public repository.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import sqlite3
@@ -123,6 +124,26 @@ class Ledger:
         return self.db.execute("SELECT 1 FROM attempts WHERE opportunity=? AND state IN "
                                "('reserved','unknown','sent')", (value,)).fetchone() is not None
 
+    def contacted(self, company):
+        return self.db.execute(
+            "SELECT 1 FROM attempts a JOIN opportunities o ON o.id=a.opportunity "
+            "WHERE o.company=? AND a.state!='not_sent' LIMIT 1", (company,)).fetchone() is not None
+
+    def company_version(self, company):
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='company_cards'").fetchone():
+            return None
+        row = self.db.execute('SELECT version FROM company_cards WHERE company_id=?', (company,)).fetchone()
+        return row['version'] if row else None
+
+    def check_company_card(self, op):
+        if self.company_version(op['company']) is None:
+            raise ValueError('every initial contact requires a current company card')
+        spec = importlib.util.spec_from_file_location('company_table', Path(__file__).with_name('company_table.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.decision(self.db, op['company'], self.now())
+        require(result['decision'] == 'write', 'company checks do not permit an initial contact')
+
     def blocked(self, op):
         return bool(op['blocked'] or self.db.execute(
             'SELECT 1 FROM company_blocks WHERE company=?', (op['company'],)).fetchone())
@@ -203,7 +224,8 @@ class Ledger:
         artifact = Path(string(data['artifact_path'])).resolve()
         h = hashlib.sha256(artifact.read_bytes()).hexdigest()
         payload = {'opportunity_id': op['id'], 'version': op['version'], 'channel': data['channel'],
-                   'recipient': data['recipient'], 'artifact_path': str(artifact), 'artifact_hash': h}
+                   'recipient': data['recipient'], 'artifact_path': str(artifact), 'artifact_hash': h,
+                   'company_version': self.company_version(op['company'])}
         body = canonical(payload)
         if body != op['payload']:
             self.db.execute('UPDATE opportunities SET payload=?,reviewed=NULL,approval=NULL WHERE id=?',
@@ -214,6 +236,8 @@ class Ledger:
         require(op['payload'], 'preparation required')
         payload = json.loads(op['payload'])
         require(payload['version'] == op['version'], 'vacancy changed; prepare again')
+        require(payload.get('company_version') == self.company_version(op['company']),
+                'company card changed; prepare again')
         actual = hashlib.sha256(Path(payload['artifact_path']).read_bytes()).hexdigest()
         require(actual == payload['artifact_hash'], 'artifact changed; prepare again')
         return payload, digest(payload)
@@ -233,6 +257,8 @@ class Ledger:
         fields(data, ('opportunity_id', 'policy_id', 'policy_hash', 'payload_digest'))
         op = self.opportunity(data['opportunity_id'])
         require(not self.blocked(op) and not self.active(op['id']), 'opportunity blocked or already attempted')
+        require(not self.contacted(op['company']), 'company already contacted or pending; use the continuation workflow')
+        self.check_company_card(op)
         payload, h = self.current_payload(op)
         require(sha(data['payload_digest']) == h == op['reviewed'] and op['approval'],
                 'current review required')
@@ -280,6 +306,9 @@ class Ledger:
         if status in ('rejected', 'no_contact'):
             self.db.execute('UPDATE opportunities SET blocked=?,reviewed=NULL,approval=NULL WHERE id=?',
                             (status, attempt['opportunity']))
+            if status == 'no_contact':
+                company = self.opportunity(attempt['opportunity'])['company']
+                self.cmd_block_company({'company_id': company, 'external_evidence': evidence})
         elif status == 'not_sent':
             self.db.execute('UPDATE opportunities SET payload=NULL,reviewed=NULL,approval=NULL WHERE id=?',
                             (attempt['opportunity'],))
@@ -296,12 +325,14 @@ class Ledger:
         self.db.execute('CREATE TABLE IF NOT EXISTS blocks(opportunity TEXT, reason TEXT, evidence TEXT)')
         self.db.execute('INSERT INTO blocks VALUES(?,?,?)',
                         (op['id'], data['reason'], data['external_evidence']))
+        if data['reason'] == 'no_contact':
+            self.cmd_block_company({'company_id': op['company'], 'external_evidence': data['external_evidence']})
         return {'opportunity_id': op['id'], 'status': 'blocked'}
 
     def cmd_queue(self, data):
         result = []
         for op in self.db.execute('SELECT * FROM opportunities ORDER BY id').fetchall():
-            if self.blocked(op) or self.active(op['id']):
+            if self.blocked(op) or self.contacted(op['company']):
                 continue
             try:
                 _, h = self.current_payload(op)
@@ -339,6 +370,8 @@ class Ledger:
                 state = 'blocked'
             elif attempt:
                 state = attempt['state']
+            elif self.contacted(op['company']):
+                state = 'company_contacted'
             else:
                 try:
                     _, payload_digest = self.current_payload(op)
